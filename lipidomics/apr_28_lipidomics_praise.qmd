@@ -5,7 +5,6 @@ This section loads all the libraries we will use throughout the pipeline. The `t
 ```{r}
 # Core tidyverse: includes dplyr, ggplot2, readr, tibble, etc.
 library(tidyverse)
-library(purrr)
 
 # Cleaning and input tools
 library(janitor)       # For cleaning column names
