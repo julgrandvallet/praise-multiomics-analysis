@@ -1,0 +1,67 @@
+# -------------------------------
+# R & RStudio files
+# -------------------------------
+.Rhistory
+.RData
+.Ruserdata
+.Rapp.history
+.Rproj.user/
+*.Rproj
+
+# -------------------------------
+# Quarto / R Markdown outputs
+# -------------------------------
+*.utf8.md
+*.knit.md
+*.html
+*.pdf
+*.docx
+
+# -------------------------------
+# File types to ignore (keep only .qmd)
+# -------------------------------
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.tiff
+*.gif
+*.bmp
+*.svg
+
+# Data files
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.txt
+*.gz
+*.zip
+*.json
+*.xml
+*.rds
+*.rda
+*.feather
+*.h5
+
+# Bioinformatics quant output
+*.sf
+*.gtf
+
+# FastQ / sequencing data
+*.fastq
+*.fastq.gz
+
+# Logs
+*.log
+
+# Python or Conda envs (if you ever use them)
+.env/
+venv/
+__pycache__/
+*.py[cod]
+
+# Mac system files
+.DS_Store
+

@@ -1,0 +1,166 @@
+# 🔹 1. Load required R packages
+
+```{r}
+library(tidyverse)  # For data manipulation and ggplot2
+library(dplyr)      # For wrangling data
+library(ggplot2)    # For plotting
+library(lipidr)     # Specialized lipidomics tools
+library(readr)      # For reading CSV files
+```
+
+# 🔹 2. Import your data
+
+```{r}
+dir_path = getwd()
+dir_path
+
+matrix <- read_csv(paste0(dir_path, "/lipidomics_matrix.csv"))
+
+coldata <- read_csv(paste0(dir_path, "/lipidomics_metadata.csv"))
+```
+
+# 🔹 3. Create a Lipidomics Experiment Object
+
+```{r}
+# Convert your raw matrix into a LipidomicsExperiment object (lipidr's main structure)
+d <- as_lipidomics_experiment(matrix)
+
+# Add sample group info to the experiment
+d <- add_sample_annotation(d, coldata)
+```
+
+# 🔹 4. Visualize raw data: Total intensity
+
+```{r}
+plot_samples(d, type = "boxplot", log = TRUE)
+```
+# 🔹 5. Supervised Multivariate Analysis (OPLS-DA)
+
+```{r}
+# Compare two groups: CAR vs Mock
+mvaresults <- mva(
+  d,
+  method = "OPLS-DA",
+  group_col = "Sample_Type",
+  groups = c("Mock", "CAR")
+)
+
+# Visualize sample separation
+plot_mva(mvaresults, color_by = "Sample_Type")
+
+# Show top lipid features that drive group separation
+plot_mva_loadings(mvaresults, color_by = "Class", top.n = 3)
+
+# List top 10 driver lipids
+top_lipids(mvaresults, top.n = 10)
+```
+
+# 🔹 6. Normalize and Transform Your Data
+
+```{r}
+# Normalize lipid intensities (PQN) and log2-transform in one step
+d_normalized <- normalize_pqn(d, measure = "Area", log = TRUE)
+
+# Mark that it’s normalized and logged
+d_normalized <- set_logged(d_normalized, "Area", TRUE)
+d_normalized <- set_normalized(d_normalized, "Area", TRUE)
+```
+
+# 🔹 7. Differential Expression (CAR vs Mock)
+
+```{r}
+# Identify differentially expressed lipids
+de_results <- de_analysis(
+  data = d_normalized,
+  contrast = CAR - Mock,
+  measure = "Area"
+)
+
+# Check first few results
+head(de_results)
+
+# Visualize distribution again post-normalization
+plot_samples(d_normalized, type = "boxplot", log = TRUE)
+```
+
+# 🔹 8. Basic Volcano Plot (from lipidr)
+
+```{r}
+# List statistically significant lipids
+significant_molecules(de_results, p.cutoff = 0.05, logFC.cutoff = 1)
+
+# Plot: Log2 Fold Change vs -log10(P-Value)
+plot_results_volcano(de_results, show.labels = FALSE)
+```
+
+# 🔹 9. Custom Volcano Plot with ggplot2
+
+```{r}
+# Define color/size/opacity styles for plotting
+cols <- c("up" = "#ffad73", "down" = "#26b3ff", "ns" = "grey")
+sizes <- c("up" = 2.5, "down" = 2.5, "ns" = 1.2)
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.5)
+
+# Create fold change categories based on P-value and FC thresholds
+volcano_data <- de_results %>%
+  drop_na(P.Value, logFC) %>%
+  mutate(
+    FoldChange = 2^(logFC),
+    GeneType = case_when(
+      FoldChange >= 2 & P.Value <= 0.1 ~ "up",
+      FoldChange <= 0.5 & P.Value <= 0.1 ~ "down",
+      TRUE ~ "ns"
+    )
+  )
+
+# Plot the volcano
+p <- ggplot(volcano_data, aes(
+  x = log2(FoldChange),
+  y = -log10(P.Value),
+  fill = GeneType,
+  size = GeneType,
+  alpha = GeneType
+)) +
+  geom_point(shape = 21, color = "black") +
+  geom_hline(yintercept = -log10(0.1), linetype = "dashed") +
+  geom_vline(xintercept = c(log2(0.5), log2(2)), linetype = "dashed") +
+  scale_fill_manual(values = cols, name = "Regulation") +
+  scale_size_manual(values = sizes, guide = "none") +
+  scale_alpha_manual(values = alphas, guide = "none") +
+  labs(
+    title = "Differential Lipids: CAR vs Mock",
+    x = "Log2 Fold Change",
+    y = "-Log10 P-Value"
+  ) +
+  theme_minimal(base_size = 13)
+
+# Add labels to up/downregulated lipids
+p + ggrepel::geom_text_repel(
+  data = filter(volcano_data, GeneType %in% c("up", "down")),
+  aes(label = Molecule),
+  size = 3,
+  max.overlaps = 10
+)
+```
+
+
+
+A 'score' for a Low Medium High
+
+
+
+
+
+
+
+
+
+
+# Stacked bar plot of the broader picture GROUPS 
+
+
+
+Standard deviation of 30% and see how they look
+# Try the plot_trend(two_group)
+
+

@@ -1,0 +1,1030 @@
+# 📦 1. Load Required R Packages
+
+This section loads all the libraries we will use throughout the pipeline. The `tidyverse` is used for general data wrangling and plotting; `LipidSigR` is the main lipidomics analysis tool; rgoslin is used for parsing lipid names; and other libraries support visualization, statistical tests, and data cleaning.
+
+```{r}
+# Core tidyverse: includes dplyr, ggplot2, readr, tibble, etc.
+library(tidyverse)
+library(purrr)
+
+# Cleaning and input tools
+library(janitor)       # For cleaning column names
+library(readxl)        # To read .xlsx files
+
+# Lipidomics tools
+library(LipidSigR)     # Main analysis package
+library(rgoslin)       # Lipid name parser
+
+# Supporting packages
+library(SummarizedExperiment)  # Core data container
+library(ggrepel)               # Non-overlapping plot labels
+library(broom)                 # Clean test output
+library(car)                   # For Levene’s test (equal variances)
+```
+
+# 📥 2. Load and Clean Input Data
+
+We load the lipidomics abundance matrix and the accompanying sample metadata, ensuring their sample names match.
+
+```{r}
+# Load metadata (sample information)
+coldata <- read_xlsx("Edited copy of dt_lipidomics_praise[4].xlsx") %>%
+  dplyr::mutate(`Sample ID` = gsub("-", "_", `Sample ID`))  # Ensure consistent sample names
+
+# Load abundance matrix (lipid intensities)
+matrix <- read_xlsx("Edited copy of praises_matrix.xlsx")
+
+# Extract sample IDs
+sample_ids <- coldata$`Sample ID`
+matrix_sample_cols <- setdiff(names(matrix), c("LipidGroup", "Class"))
+
+# Basic integrity checks
+setdiff(sample_ids, matrix_sample_cols)    # Should return character(0)
+setdiff(matrix_sample_cols, sample_ids)    # Should return character(0)
+length(sample_ids) == length(matrix_sample_cols)  # Should be TRUE
+all(sample_ids == matrix_sample_cols)             # Should be TRUE (optional)
+```
+
+# 📊 3. Manual Preprocessing: Normalization, Transformation & Exploratory Analysis
+
+This section manually replicates core preprocessing operations usually abstracted by lipidomics packages. Doing this step-by-step makes the workflow more transparent and adaptable for other datasets or method comparisons.
+
+## 🔹 3.1 Manual Normalization and Log Transformation
+This step prepares the lipid abundance matrix for downstream statistical analysis. It includes:
+
+Dropping non-numerical annotation columns,
+
+Imputing missing values with half the minimum observed (a conservative approach to avoid inflation),
+
+Normalizing each sample to control for total lipid abundance differences (compositional correction),
+
+Applying a log10 transformation to stabilize variance and reduce skewness.
+
+```{r}
+# 1. Subset to lipid values only
+data <- matrix %>%
+  select(-LipidGroup, -Class)
+
+# 2. Impute missing values with half the minimum observed
+min_val <- min(data, na.rm = TRUE)
+data[is.na(data)] <- 0.5 * min_val
+
+# 3. Restore lipid names as rownames
+rownames(data) <- matrix$LipidGroup
+
+# 4. Normalize each column (sample) to sum to 100
+data_norm <- sweep(data, 2, colSums(data), FUN = "/") * 100
+
+# 5. Log10-transform (adding pseudocount to avoid -Inf)
+data_log <- log10(data_norm + 1e-6)
+```
+
+## 🔹 3.2 Correlation Heatmap
+This diagnostic plot evaluates global similarity between samples based on their lipidomic profiles. Pearson correlation is used to capture linear relationships between sample vectors. Hierarchical clustering reveals patterns of sample grouping, aiding quality control and biological interpretation.
+
+
+```{r}
+# Calculate correlation matrix using log-transformed data
+cor_matrix <- cor(data_log, use = "pairwise.complete.obs")
+
+# Create detailed sample names
+detailed_names <- paste(coldata$`Cell type`, coldata$`FATP2 status`, coldata$`Days in incubation`, sep = "_")
+
+# Plot correlation heatmap
+pheatmap::pheatmap(
+  cor_matrix,
+  clustering_distance_rows = "correlation",
+  clustering_distance_cols = "correlation",
+  main = "Sample Correlation Matrix",
+  labels_row = detailed_names,
+  labels_col = detailed_names,
+  fontsize_row = 9,
+  fontsize_col = 9,
+  fontsize = 11,
+  display_numbers = FALSE,
+  number_format = "%.2f",
+  color = colorRampPalette(c("navy", "white", "firebrick3"))(50)
+)
+```
+
+## 🔹 3.3 Principal Component Analysis (PCA)
+Principal Component Analysis (PCA) reduces the dimensionality of the lipid dataset while preserving most of the variance. This step is performed on the normalized and log-transformed data to identify patterns, detect outliers, and visualize sample grouping by experimental conditions. PCA is computed with centering and scaling enabled to ensure comparability across lipids with different dynamic range
+
+```{r}
+# 1. Run PCA (transpose because rows = lipids, columns = samples)
+pca <- prcomp(t(data_log), center = TRUE, scale. = TRUE)
+
+# 2. Extract PC1 and PC2 scores per sample
+pca_scores <- as.data.frame(pca$x[, 1:2])
+pca_scores$SampleID <- rownames(pca_scores)
+
+# 3. Merge PCA scores with metadata
+pca_scores_annotated <- pca_scores %>%
+  left_join(
+    coldata %>% dplyr::rename(SampleID = `Sample ID`),
+    by = "SampleID"
+  )
+
+# 4. Plot PCA with annotations
+ggplot(pca_scores_annotated, aes(x = PC1, y = PC2,
+                                 color = `Days in incubation`,
+                                 shape = `FATP2 status`)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_minimal() +
+  labs(
+    title = "PCA of Lipid Data (Manual)",
+    x = paste0("PC1 (", round(100 * summary(pca)$importance[2, 1], 1), "% variance)"),
+    y = paste0("PC2 (", round(100 * summary(pca)$importance[2, 2], 1), "% variance)")
+  ) +
+  theme(
+    plot.title = element_text(hjust = 0.5),
+    legend.position = "right"
+  )
+
+```
+
+## 🧬 4. Lipid Class Composition by Sample
+This section summarizes the distribution of lipid abundance by **lipid class**, allowing for inspection of broader biochemical patterns before focusing on individual lipid species. Plotting the relative class composition per sample (as horizontal stacked barplots) provides a quick visual assessment of whether certain experimental conditions are associated with enrichment or depletion of specific classes, such as TAGs, PCs, or PEs. This is especially useful in hypothesis generation and exploratory phase analysis.
+
+```{r}
+class_abundance <- matrix %>%
+  pivot_longer(cols = -c(LipidGroup, Class), names_to = "Sample", values_to = "Abundance") %>%
+  mutate(Abundance = replace_na(Abundance, 0)) %>%
+  group_by(Sample, Class) %>%
+  summarise(Total = sum(Abundance), .groups = "drop") %>%
+  group_by(Sample) %>%
+  mutate(Relative = Total / sum(Total) * 100) %>%
+  ungroup()
+
+# Horizontal stacked barplot
+ggplot(class_abundance, aes(x = Sample, y = Relative, fill = Class)) +
+  geom_bar(stat = "identity") +
+  coord_flip() +
+  labs(title = "Lipid Class Composition by Sample", x = "Sample", y = "Relative Abundance (%)") +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 8), axis.text.x = element_text(size = 10), legend.position = "right")
+```
+
+
+
+## 📊 5. Distribution Diagnostics for Statistical Testing
+
+Before selecting a differential expression method, it is essential to assess whether the data meet key assumptions for parametric testing. This section evaluates:
+
+- *Normality* within each group using the **Shapiro-Wilk test**,  
+- *Homogeneity of variance* using **Levene’s test**,  
+- *Similarity in distributional shape* using **interquartile range (IQR)**.
+
+Based on these diagnostics, each lipid is flagged for testing with a **parametric Welch’s t-test** (when assumptions are met) or a **non-parametric Wilcoxon test** (when assumptions are violated but shape is similar). Lipids that fail both criteria are flagged for exclusion. This diagnostic pipeline ensures that downstream *p*-values are statistically valid and biologically interpretable.
+
+
+```{r}
+# Prepare long-format Day 3 data with group info
+day3_long <- data_log %>%
+  rownames_to_column("LipidGroup") %>% 
+  pivot_longer(-LipidGroup, names_to = "Sample", values_to = "Abundance") %>%
+  left_join(coldata %>% dplyr::rename(Sample = `Sample ID`), by = "Sample") %>%
+  filter(`Days in incubation` == "5+ days") %>%
+  mutate(group = `FATP2 status`)
+
+# Normality check per lipid and group
+shapiro_results <- day3_long %>%
+  group_by(LipidGroup, group) %>%
+  summarise(shapiro_p = tryCatch(shapiro.test(Abundance)$p.value, error = function(e) NA_real_), .groups = "drop") %>%
+  pivot_wider(names_from = group, values_from = shapiro_p, names_prefix = "shapiro_") %>%
+  mutate(normal_KO = shapiro_KO > 0.05, normal_WT = shapiro_WT > 0.05)
+
+# Equal variance check
+levene_results <- day3_long %>%
+  group_by(LipidGroup) %>%
+  summarise(levene_p = leveneTest(Abundance ~ group)$`Pr(>F)`[1], .groups = "drop") %>%
+  mutate(equal_var = levene_p > 0.05)
+
+# Shape similarity using IQR
+iqr_results <- day3_long %>%
+  group_by(LipidGroup, group) %>%
+  summarise(IQR = IQR(Abundance), .groups = "drop") %>%
+  pivot_wider(names_from = group, values_from = IQR) %>%
+  mutate(similar_shape = abs(WT - KO) / pmax(WT, KO) < 0.3)
+
+# Combine all results
+assumptions_summary <- shapiro_results %>%
+  left_join(levene_results, by = "LipidGroup") %>%
+  left_join(iqr_results, by = "LipidGroup") %>%
+  mutate(
+    use_ttest = normal_KO & normal_WT & equal_var,
+    use_wilcox = !use_ttest & similar_shape,
+    skip = is.na(use_ttest) & is.na(use_wilcox)
+  )
+
+table(assumptions_summary$use_ttest)
+```
+
+------------------------------------------------------------------------
+
+## 🧪 6. Differential Expression Analysis (Welch’s T-test)
+
+This section performs lipid-wise differential expression analysis comparing **WT vs KO** samples on **Day 0**. The test used is **Welch’s t-test**, which does not assume equal variance between groups. In addition to raw *p*-values, log- and linear-scale fold changes are computed, and *p*-values are corrected using the False Discovery Rate (FDR) method.
+
+This analysis quantifies direction and magnitude of change for each lipid species, producing a table suitable for volcano plots or class-wise interpretation.
+
+
+```{r}
+# Prepare clean Day 3 dataset
+day3_log <- data_log %>%
+  rownames_to_column("LipidGroup") %>%
+  pivot_longer(-LipidGroup, names_to = "Sample", values_to = "Abundance") %>%
+  left_join(coldata %>% dplyr::rename(Sample = `Sample ID`), by = "Sample") %>%
+  filter(`Days in incubation` == "0 days") %>%
+  mutate(group = `FATP2 status`, group = factor(group, levels = c("WT", "KO")))
+
+# Compute group-wise means for KO and WT
+group_means <- day3_log %>%
+  group_by(LipidGroup, group) %>%
+  summarise(mean_expr = mean(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = group, values_from = mean_expr, names_prefix = "mean_") %>%
+  mutate(
+  log10_FC = mean_WT - mean_KO,
+  FC = 10 ^ log10_FC,
+  log2_FC = log10_FC * log2(10)
+)
+
+
+# Run Welch’s t-test (safe wrapper)
+safe_t_test <- safely(~ t.test(Abundance ~ group, data = .x, var.equal = FALSE))
+
+# Run test and merge with FCs
+t_test_results <- day3_log %>%
+  group_by(LipidGroup) %>%
+  nest() %>%
+  mutate(
+    t_result = map(data, safe_t_test),
+    t_output = map(t_result, "result"),
+    t_tidy = map(t_output, ~ if (!is.null(.x)) broom::tidy(.x) else NULL)
+  ) %>%
+  unnest(t_tidy) %>%
+  select(LipidGroup, statistic, p.value) %>%
+  mutate(p_adj = p.adjust(p.value, method = "fdr")) %>%
+  left_join(group_means, by = "LipidGroup") %>%
+  select(LipidGroup, mean_WT, mean_KO, FC, log2_FC, statistic, p.value, p_adj)
+
+# Preview results
+head(t_test_results)
+
+```
+
+------------------------------------------------------------------------
+## 🧬 7. Integrate Lipid Classes and Visualize by Class
+
+To enhance biological interpretability, this section annotates the differential expression results with lipid class information and visualizes **significant hits (padj ≤ 0.05)** by class. The resulting plot shows fold changes on the *x*-axis and lipid classes on the *y*-axis.
+
+This step helps identify whether changes in specific lipid categories (e.g., ceramides, TAGs, PEs) are consistently enriched, guiding further functional insights.
+
+
+```{r}
+lipid_classes <- matrix %>% select(LipidGroup, Class) %>% distinct()
+t_test_results <- t_test_results %>%
+  left_join(lipid_classes, by = "LipidGroup")
+
+
+class_plot <- t_test_results %>%
+  filter(p_adj <= 0.05) %>%
+  ggplot(aes(x = FC, y = Class, color = Class)) +
+  xlim(0,4) +
+  geom_point(size = 4) +
+  geom_vline(xintercept = 1, linetype = "dashed")+  # FC = 1 = no change
+  theme_minimal() +
+ labs(
+  title = "Significant Differential Lipids by Class (5+ days, padj ≤ 0.05)",
+  x = "Fold Change (WT / KO)",
+  y = "Lipid Class"
+)+
+  theme(legend.position = "none")
+
+
+```
+
+------------------------------------------------------------------------
+
+## 🌋 8. Volcano Plot: Differential Lipid Species
+
+This section visualizes the outcome of the differential expression analysis using a volcano plot. Each lipid is categorized as *upregulated*, *downregulated*, or *non-significant* based on predefined log2 fold-change and adjusted p-value thresholds. Lipids are color-coded by their class or significance, and labeled if they meet cutoffs.
+
+This type of visualization helps to simultaneously assess effect size and statistical significance, highlighting biologically meaningful hits while controlling for false discovery.
+
+```{r}
+cols <- c("up" = "#ffad73", "down" = "#26b3ff", "ns" = "grey")
+sizes <- c("up" = 2.5, "down" = 2.5, "ns" = 1.2)
+alphas <- c("up" = 1, "down" = 1, "ns" = 0.05)
+
+
+# 🔧 Thresholds
+padj_threshold <- 0.05
+fc_upper <- 1.5
+fc_lower <- 0.5
+log2_fc_upper <- log2(fc_upper)
+log2_fc_lower <- log2(fc_lower)
+
+# 🧬 Annotate volcano data
+volcano_data <- t_test_results %>%
+  dplyr::mutate(
+    GeneType = dplyr::case_when(
+      FC >= fc_upper & p_adj <= padj_threshold ~ "up",
+      FC <= fc_lower & p_adj <= padj_threshold ~ "down",
+      TRUE ~ "ns"
+    ),
+    Molecule = LipidGroup,
+    ClassColored = dplyr::case_when(
+      GeneType == "ns" ~ "NS",          # non-significant
+      TRUE ~ Class                      # significant → keep class
+    )
+  )
+
+# 🎨 Color palette
+classes <- sort(unique(na.omit(volcano_data$ClassColored)))
+palette_colors <- if (length(classes) <= 8) {
+  RColorBrewer::brewer.pal(length(classes), "Set2")
+} else {
+  scales::hue_pal()(length(classes))
+}
+class_colors <- setNames(palette_colors, classes)
+class_colors["NS"] <- "grey80"  # Color for non-significant
+
+# 📊 Volcano plot
+p <- ggplot(volcano_data, aes(
+  x = log2_FC,
+  y = -log10(p_adj),
+  fill = ClassColored,
+  size = GeneType,
+  alpha = GeneType
+)) +
+  geom_point(shape = 21, color = "black") +
+  ggrepel::geom_text_repel(
+    data = dplyr::filter(volcano_data, GeneType %in% c("up", "down")),
+    aes(label = Molecule),
+    size = 3,
+    max.overlaps = 5,
+    box.padding = 0.4,
+    point.padding = 0.3,
+    segment.size = 0.3,
+    show.legend = FALSE
+  ) +
+  geom_hline(yintercept = -log10(padj_threshold), linetype = "dashed") +
+  geom_vline(xintercept = c(log2_fc_lower, log2_fc_upper), linetype = "dashed", color = "gray40") +
+  scale_x_continuous(
+    breaks = c(-2, -1, 0, 1, 2),
+    labels = c("-2", "-1", "0", "1", "2"),
+    expand = expansion(mult = c(0.01, 0.05))
+  ) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+  scale_fill_manual(values = class_colors, name = "Lipid Class") +
+  scale_size_manual(values = c("up" = 2.5, "down" = 2.5, "ns" = 1.2), guide = "none") +
+  scale_alpha_manual(values = c("up" = 1, "down" = 1, "ns" = 0.05), guide = "none") +
+  labs(
+    title = "Volcano Plot (Log2FC): WT vs KO",
+    subtitle = paste0("Significant = FC ≤ ", fc_lower, " or FC ≥ ", fc_upper,
+                      " and padj ≤ ", padj_threshold),
+    x = "Log2 Fold Change (WT / KO)",
+    y = expression(-log[10]("Adjusted P-Value"))
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title = element_text(hjust = 0.5, face = "bold"),
+    plot.subtitle = element_text(hjust = 0.5, size = 11),
+    axis.text = element_text(size = 10)
+  )
+
+p
+
+```
+
+## 🧮 9. Differential Lipid Expression Over Time (Custom Function)
+
+To generalize comparisons across timepoints and genotypes, this section defines a reusable function that performs differential expression analysis between two timepoints (with optional genotype stratification). For each comparison, it generates:
+
+- A fold-change scatter plot by lipid class,
+- A volcano plot of significant lipids,
+- A heatmap of the top differentially expressed lipids (if applicable).
+
+This modular approach enhances flexibility and reproducibility, making it easier to compare temporal dynamics between conditions.
+
+
+```{r}
+run_de_time_comparison <- function(data_log, coldata, group_col = "FATP2 status", 
+                                   timepoint1, timepoint2, genotype = NULL, padj_threshold = 0.1) {
+  # 1. Prepare long-format data and subset by timepoints
+  df_long <- data_log %>%
+    rownames_to_column("LipidGroup") %>%
+    pivot_longer(-LipidGroup, names_to = "Sample", values_to = "Abundance") %>%
+    left_join(coldata %>% dplyr::rename(Sample = `Sample ID`), by = "Sample") %>%
+    filter(`Days in incubation` %in% c(timepoint1, timepoint2)) %>%
+    {
+      if (!is.null(genotype)) filter(., `FATP2 status` == genotype) else .
+    } %>%
+    mutate(group = factor(`Days in incubation`, levels = c(timepoint1, timepoint2)))
+
+  # 2. Compute means and log2FC
+group_means <- df_long %>%
+  group_by(LipidGroup, group) %>%
+  summarise(mean_expr = mean(Abundance, na.rm = TRUE), .groups = "drop") %>%
+  pivot_wider(names_from = group, values_from = mean_expr, names_prefix = "mean_") %>%
+  mutate(
+    log10_FC = .data[[paste0("mean_", timepoint2)]] - .data[[paste0("mean_", timepoint1)]],
+    FC = 10 ^ log10_FC,
+    log2_FC = log10_FC * log2(10)
+  )
+
+
+  # 3. Run Welch’s t-test
+  safe_t_test <- safely(~ t.test(Abundance ~ group, data = .x, var.equal = FALSE))
+  de_results <- df_long %>%
+    group_by(LipidGroup) %>%
+    nest() %>%
+    mutate(
+      t_result = map(data, safe_t_test),
+      t_output = map(t_result, "result"),
+      t_tidy = map(t_output, ~ if (!is.null(.x)) broom::tidy(.x) else NULL)
+    ) %>%
+    unnest(t_tidy) %>%
+    select(LipidGroup, statistic, p.value) %>%
+    mutate(p_adj = p.adjust(p.value, method = "fdr")) %>%
+    left_join(group_means, by = "LipidGroup")
+
+  # 4. Add class annotations
+  lipid_classes <- matrix %>% select(LipidGroup, Class) %>% distinct()
+  de_results <- de_results %>%
+    left_join(lipid_classes, by = "LipidGroup")
+
+  # 5. FC by class
+  fc_plot <- de_results %>%
+    filter(p_adj <= padj_threshold) %>%
+    ggplot(aes(x = FC, y = Class, color = Class)) +
+    geom_point(size = 4) +
+    geom_vline(xintercept = 1, linetype = "dashed") +
+    xlim(0, 4) +
+    theme_minimal() +
+    labs(
+  title = paste("Significant Lipids by Class —", timepoint1, "vs", timepoint2,
+                if (!is.null(genotype)) paste0(" (", genotype, ")") else "",
+                paste0(" — padj ≤ ", padj_threshold)),
+  x = paste0("Fold Change (", timepoint2, " / ", timepoint1, ")"),
+  y = "Lipid Class"
+) +
+    theme(legend.position = "none")
+
+  # 6. Volcano plot
+  # 6. Volcano plot
+volcano_data <- de_results %>%
+  filter(!is.na(FC), !is.na(p_adj)) %>%
+  mutate(
+    GeneType = case_when(
+      FC >= 1.5 & p_adj <= padj_threshold ~ "up",
+      FC <= 0.5 & p_adj <= padj_threshold ~ "down",
+      TRUE ~ "ns"
+    ),
+    Molecule = LipidGroup
+  )
+
+
+  if (any(volcano_data$GeneType %in% c("up", "down"))) {
+    volcano_plot <- ggplot(volcano_data, aes(
+      x = FC,
+      y = -log10(p_adj),
+      fill = GeneType,
+      size = GeneType,
+      alpha = GeneType
+    )) +
+      geom_point(shape = 21, color = "black") +
+      ggrepel::geom_text_repel(
+        data = subset(volcano_data, GeneType %in% c("up", "down")),
+        aes(label = Molecule),
+        size = 3,
+        max.overlaps = 5,
+        box.padding = 0.4,
+        point.padding = 0.3,
+        segment.size = 0.3,
+        show.legend = FALSE
+      ) +
+      geom_hline(yintercept = -log10(padj_threshold), linetype = "dashed") +
+      geom_vline(xintercept = c(0.5, 1.5), linetype = "dashed", color = "gray40") +
+      scale_x_continuous(
+        breaks = c(0.25, 0.5, 1, 1.5, 2, 4),
+        labels = c("0.25", "0.5", "1", "1.5", "2", "4"),
+        limits = c(0.25, 4)
+      ) +
+      scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+      scale_fill_manual(values = cols, name = "Regulation") +
+      scale_size_manual(values = sizes, guide = "none") +
+      scale_alpha_manual(values = alphas, guide = "none") +
+      labs(
+        title = paste("Volcano Plot:", timepoint1, "vs", timepoint2,
+                      if (!is.null(genotype)) paste0("(", genotype, ")") else ""),
+        subtitle = paste0("Thresholds: FC ≤ 0.5 or FC ≥ 1.5 and padj ≤ ", padj_threshold),
+        x = paste0("Fold Change (", timepoint2, " / ", timepoint1, ")"),
+        y = expression(-log[10]("Adjusted P-Value"))
+      ) +
+      theme_minimal(base_size = 13) +
+      theme(
+        plot.title = element_text(hjust = 0.5),
+        plot.subtitle = element_text(hjust = 0.5, size = 11)
+      )
+  } else {
+  volcano_plot <- ggplot() +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title = element_text(hjust = 0.5),
+      plot.subtitle = element_text(hjust = 0.5, size = 11),
+      axis.text = element_blank(),
+      axis.title = element_blank(),
+      panel.grid = element_blank()
+    ) +
+    labs(
+      title = paste("Volcano Plot:", timepoint1, "vs", timepoint2,
+                    if (!is.null(genotype)) paste0("(", genotype, ")") else ""),
+      subtitle = paste0("No significant hits (padj ≤ ", padj_threshold, ")"),
+      x = NULL,
+      y = NULL
+    )
+  }
+  
+  # Heatmap
+  
+  # 7. Heatmap of significant lipids
+if (nrow(de_results %>% filter(p_adj <= padj_threshold)) > 0) {
+  # Determine annotation column based on comparison type
+  selected_samples <- coldata %>%
+    filter(`Days in incubation` %in% c(timepoint1, timepoint2)) %>%
+    filter(is.null(genotype) | `FATP2 status` == genotype) %>%
+    arrange(
+      if (!is.null(genotype)) `Days in incubation` else `FATP2 status`,
+      `Sample ID`
+    ) %>%
+    pull(`Sample ID`)
+
+  # Filter lipids
+  top_lipids <- de_results %>%
+  filter(p_adj <= padj_threshold) %>%
+  arrange(p_adj) %>%
+  slice_head(n = 10) %>%
+  pull(LipidGroup)
+
+  heatmap_matrix <- data_log[top_lipids, selected_samples]
+  heatmap_scaled <- t(scale(t(heatmap_matrix)))
+
+  # Annotation: show group depending on comparison
+  if (!is.null(genotype)) {
+    # Comparing days within one genotype: annotate with day
+    annotation_col <- coldata %>%
+      filter(`Sample ID` %in% selected_samples) %>%
+      select(`Sample ID`, `Days in incubation`) %>%
+      column_to_rownames("Sample ID")
+  } else {
+    # Comparing genotypes at same day: annotate with genotype
+    annotation_col <- coldata %>%
+      filter(`Sample ID` %in% selected_samples) %>%
+      select(`Sample ID`, `FATP2 status`) %>%
+      column_to_rownames("Sample ID")
+  }
+
+  heatmap_obj <- pheatmap::pheatmap(
+    heatmap_scaled,
+    annotation_col = annotation_col,
+    clustering_distance_rows = "euclidean",
+    clustering_distance_cols = "euclidean",
+    clustering_method = "ward.D2",
+    color = colorRampPalette(c("navy", "white", "firebrick3"))(100),
+    fontsize_row = 9,
+    fontsize_col = 9,
+    main = paste("Heatmap —", timepoint1, "vs", timepoint2,
+                 if (!is.null(genotype)) paste0(" (", genotype, ")") else ""),
+    border_color = NA,
+    show_rownames = TRUE,
+    show_colnames = FALSE,
+    cluster_rows = FALSE
+  )
+} else {
+  heatmap_obj <- NULL
+}
+
+  
+  
+
+
+  return(list(
+  de_results = de_results,
+  foldchange_plot = fc_plot,
+  volcano_plot = volcano_plot,
+  heatmap = heatmap_obj
+))
+
+}
+
+
+```
+
+## ✅ 10. Execute Timepoint Comparisons — KO Group
+
+Here we apply the timepoint comparison function to the **KO group** across three consecutive time windows:
+
+- 0 days → 1 day  
+- 1 day → 3 days  
+- 3 days → 5+ days
+
+Each call produces DE statistics, a fold-change visualization, a volcano plot, and optionally a heatmap. These outputs highlight temporal dynamics in lipidomic changes specifically within KO samples.
+
+
+
+```{r}
+ko_d1_vs_d0 <- run_de_time_comparison(
+  data_log = data_log,
+  coldata = coldata,
+  timepoint1 = "0 days",
+  timepoint2 = "1 day",
+  genotype = "KO",
+  padj_threshold = 0.05
+)
+
+ko_d3_vs_d1 <- run_de_time_comparison(
+  data_log = data_log,
+  coldata = coldata,
+  timepoint1 = "1 day",
+  timepoint2 = "3 days",
+  genotype = "KO",
+  padj_threshold = 0.05
+)
+
+ko_d5_vs_d3 <- run_de_time_comparison(
+  data_log = data_log,
+  coldata = coldata,
+  timepoint1 = "3 days",
+  timepoint2 = "5+ days",
+  genotype = "KO",
+  padj_threshold = 0.05
+)
+```
+
+## ✅ 11. Execute Timepoint Comparisons — WT Group
+
+This section mirrors the KO timepoint comparisons, but applies the analysis to the **WT group**. Keeping the method consistent ensures that differences between KO and WT are attributable to biological signal rather than technical inconsistency.
+
+
+
+```{r}
+wt_d1_vs_d0 <- run_de_time_comparison(
+  data_log = data_log,
+  coldata = coldata,
+  timepoint1 = "0 days",
+  timepoint2 = "1 day",
+  genotype = "WT",
+  padj_threshold = 0.05
+)
+
+wt_d3_vs_d1 <- run_de_time_comparison(
+  data_log = data_log,
+  coldata = coldata,
+  timepoint1 = "1 day",
+  timepoint2 = "3 days",
+  genotype = "WT",
+  padj_threshold = 0.05
+)
+
+wt_d5_vs_d3 <- run_de_time_comparison(
+  data_log = data_log,
+  coldata = coldata,
+  timepoint1 = "3 days",
+  timepoint2 = "5+ days",
+  genotype = "WT",
+  padj_threshold = 0.05
+)
+```
+
+## 💾 12. Save DE Results and Plots by Timepoint and Genotype
+
+To preserve results for reporting and reproducibility, this section defines a helper function to systematically save:
+
+- Differential expression result tables (.csv),
+- Fold-change plots (.pdf),
+- Volcano plots (.pdf).
+
+The output structure follows a standardized folder hierarchy based on genotype and comparison labels.
+
+
+```{r}
+library(fs)
+library(ggplot2)
+library(readr)
+library(stringr)
+
+# Define base directory
+base_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Praise/lipidomics/comparisons_perday_pergenotype_May8/per_Day"
+
+# Helper function to clean strings
+clean_name <- function(x) {
+  str_replace_all(tolower(x), "[^a-z0-9]+", "_") %>% str_replace_all("_+", "_") %>% str_remove("_$")
+}
+
+# Save DE outputs with clean naming
+save_de_outputs <- function(result_obj, genotype, timepoint1, timepoint2) {
+  tp1_clean <- clean_name(timepoint1)
+  tp2_clean <- clean_name(timepoint2)
+  comparison_label <- paste0("d", str_remove(tp2_clean, "_days|_"), "_vs_d", str_remove(tp1_clean, "_days|_"))
+  
+  out_dir <- file.path(base_dir, genotype, comparison_label)
+  dir_create(out_dir, recurse = TRUE)
+
+  # File paths
+  csv_path <- file.path(out_dir, paste0("DE_results_", genotype, "_", comparison_label, ".csv"))
+  fc_path  <- file.path(out_dir, paste0("FoldChange_", genotype, "_", comparison_label, ".pdf"))
+  volcano_path <- file.path(out_dir, paste0("Volcano_", genotype, "_", comparison_label, ".pdf"))
+
+  # Save CSV
+  write_csv(result_obj$de_results, csv_path)
+
+  # Save plots
+  ggsave(fc_path, plot = result_obj$foldchange_plot, width = 8, height = 6, dpi = 300)
+  ggsave(volcano_path, plot = result_obj$volcano_plot, width = 8, height = 6, dpi = 300)
+}
+
+# --- Save KO comparisons ---
+save_de_outputs(ko_d1_vs_d0, "KO", "0 days", "1 day")
+save_de_outputs(ko_d3_vs_d1, "KO", "1 day", "3 days")
+save_de_outputs(ko_d5_vs_d3, "KO", "3 days", "5+ days")
+
+# --- Save WT comparisons ---
+save_de_outputs(wt_d1_vs_d0, "WT", "0 days", "1 day")
+save_de_outputs(wt_d3_vs_d1, "WT", "1 day", "3 days")
+save_de_outputs(wt_d5_vs_d3, "WT", "3 days", "5+ days")
+
+```
+
+
+## ⚖️ 13. Differential Expression Between Genotypes (WT vs KO) per Day
+
+This section shifts focus from intra-genotype dynamics to **inter-genotype comparisons at fixed timepoints**. Using a custom function, we compare WT vs KO for each of the following:
+
+- Day 0  
+- Day 1  
+- Day 3  
+- Day 5+
+
+Each comparison produces DE tables, volcano plots, fold-change distributions, and class-level barplots for up- and downregulated lipids.
+
+
+```{r}
+run_de_genotype_comparison <- function(data_log, coldata, day, padj_threshold = 0.1) {
+  # 1. Prepare long-format data for selected day
+  df_long <- data_log %>%
+    rownames_to_column("LipidGroup") %>%
+    pivot_longer(-LipidGroup, names_to = "Sample", values_to = "Abundance") %>%
+    left_join(coldata %>% dplyr::rename(Sample = `Sample ID`), by = "Sample") %>%
+    filter(`Days in incubation` == day) %>%
+    mutate(group = factor(`FATP2 status`, levels = c("KO", "WT")))  # KO = denominator
+
+  # 2. Compute means and FC (WT / KO)
+  group_means <- df_long %>%
+    group_by(LipidGroup, group) %>%
+    summarise(mean_expr = mean(Abundance, na.rm = TRUE), .groups = "drop") %>%
+    pivot_wider(names_from = group, values_from = mean_expr, names_prefix = "mean_") %>%
+    mutate(
+      log10_FC = mean_WT - mean_KO,
+      FC = 10 ^ log10_FC,
+      log2_FC = log10_FC * log2(10)
+    )
+
+  # 3. Run Welch’s t-test
+  safe_t_test <- safely(~ t.test(Abundance ~ group, data = .x, var.equal = FALSE))
+  de_results <- df_long %>%
+    group_by(LipidGroup) %>%
+    nest() %>%
+    mutate(
+      t_result = map(data, safe_t_test),
+      t_output = map(t_result, "result"),
+      t_tidy = map(t_output, ~ if (!is.null(.x)) broom::tidy(.x) else NULL)
+    ) %>%
+    unnest(t_tidy) %>%
+    select(LipidGroup, statistic, p.value) %>%
+    mutate(p_adj = p.adjust(p.value, method = "fdr")) %>%
+    left_join(group_means, by = "LipidGroup")
+
+  # 4. Add class annotations
+  lipid_classes <- matrix %>% select(LipidGroup, Class) %>% distinct()
+  de_results <- de_results %>%
+    left_join(lipid_classes, by = "LipidGroup")
+
+  # 5. FC by class
+  fc_plot <- de_results %>%
+    filter(p_adj <= padj_threshold) %>%
+    ggplot(aes(x = FC, y = Class, color = Class)) +
+    geom_point(size = 4) +
+    geom_vline(xintercept = 1, linetype = "dashed") +
+    xlim(0, 4) +
+    theme_minimal() +
+    labs(
+      title = paste("Significant Lipids by Class — WT vs KO at", day,
+                    paste0(" — padj ≤ ", padj_threshold)),
+      x = "Fold Change (WT / KO)",
+      y = "Lipid Class"
+    ) +
+    theme(legend.position = "none")
+
+ # 6. Volcano plot
+volcano_data <- de_results %>%
+  filter(!is.na(FC), !is.na(p_adj)) %>%
+  mutate(
+    GeneType = case_when(
+      FC >= 1.5 & p_adj <= padj_threshold ~ "up",
+      FC <= 0.5 & p_adj <= padj_threshold ~ "down",
+      TRUE ~ "ns"
+    ),
+    Molecule = LipidGroup,
+    ClassColored = case_when(
+      GeneType == "ns" ~ "NS",
+      TRUE ~ Class
+    )
+  )
+
+# Assign color palette
+classes <- sort(unique(na.omit(volcano_data$ClassColored)))
+palette_colors <- if (length(classes) <= 8) {
+  RColorBrewer::brewer.pal(length(classes), "Set2")
+} else {
+  scales::hue_pal()(length(classes))
+}
+class_colors <- setNames(palette_colors, classes)
+class_colors["NS"] <- "grey80"
+
+# Plot
+if (any(volcano_data$GeneType %in% c("up", "down"))) {
+  volcano_plot <- ggplot(volcano_data, aes(
+    x = log2_FC,
+    y = -log10(p_adj),
+    fill = ClassColored,
+    size = GeneType,
+    alpha = GeneType
+  )) +
+    geom_point(shape = 21, color = "black") +
+    ggrepel::geom_text_repel(
+      data = filter(volcano_data, GeneType %in% c("up", "down")),
+      aes(label = Molecule),
+      size = 3,
+      max.overlaps = 5,
+      box.padding = 0.4,
+      point.padding = 0.3,
+      segment.size = 0.3,
+      show.legend = FALSE
+    ) +
+    geom_hline(yintercept = -log10(padj_threshold), linetype = "dashed") +
+    geom_vline(xintercept = c(log2(0.5), log2(1.5)), linetype = "dashed", color = "gray40") +
+    scale_x_continuous(
+      breaks = c(-2, -1, 0, 1, 2),
+      labels = c("-2", "-1", "0", "1", "2"),
+      expand = expansion(mult = c(0.01, 0.05))
+    ) +
+    scale_y_continuous(expand = expansion(mult = c(0, 0.05))) +
+    scale_fill_manual(values = class_colors, name = "Lipid Class") +
+    scale_size_manual(values = c("up" = 2.5, "down" = 2.5, "ns" = 1.2), guide = "none") +
+    scale_alpha_manual(values = c("up" = 1, "down" = 1, "ns" = 0.25), guide = "none") +
+    labs(
+      title = paste("Volcano Plot (Log2FC): WT vs KO at", day),
+      subtitle = paste0("Significant = FC ≤ 0.5 or FC ≥ 1.5 and padj ≤ ", padj_threshold),
+      x = "Log2 Fold Change (WT / KO)",
+      y = expression(-log[10]("Adjusted P-Value"))
+    ) +
+    theme_minimal(base_size = 13) +
+    theme(
+      plot.title = element_text(hjust = 0.5, face = "bold"),
+      plot.subtitle = element_text(hjust = 0.5, size = 11),
+      axis.text = element_text(size = 10)
+    )
+} else {
+  volcano_plot <- ggplot() +
+    theme_void() +
+    labs(
+      title = paste("Volcano Plot:", day, "(WT vs KO)"),
+      subtitle = paste0("No significant hits (padj ≤ ", padj_threshold, ")")
+    )
+}
+
+# 7. Proportion barplots for significant up/downregulated lipids
+class_counts <- volcano_data %>%
+  dplyr::filter(GeneType %in% c("up", "down")) %>%
+  dplyr::count(GeneType, Class, name = "Count") %>%
+  dplyr::group_by(GeneType) %>%
+  dplyr::mutate(Proportion = Count / sum(Count)) %>%
+  dplyr::ungroup()
+
+n_classes <- length(unique(class_counts$Class))
+palette_colors <- if (n_classes <= 8) {
+  RColorBrewer::brewer.pal(n_classes, "Set2")
+} else {
+  scales::hue_pal()(n_classes)
+}
+class_colors <- setNames(palette_colors, sort(unique(class_counts$Class)))
+
+plot_up <- class_counts %>%
+  dplyr::filter(GeneType == "up") %>%
+  ggplot(aes(x = GeneType, y = Proportion, fill = Class)) +
+  geom_bar(stat = "identity", width = 1, colour = NA) +
+  scale_fill_manual(values = class_colors) +
+  labs(
+    title = paste("Upregulated Lipid Classes (WT vs KO,", day, ")"),
+    x = NULL, y = "Proportion"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.title = element_text(size = 10),
+        legend.position = "right")
+
+plot_down <- class_counts %>%
+  dplyr::filter(GeneType == "down") %>%
+  ggplot(aes(x = GeneType, y = Proportion, fill = Class)) +
+  geom_bar(stat = "identity", width = 1, colour = NA) +
+  scale_fill_manual(values = class_colors) +
+  labs(
+    title = paste("Downregulated Lipid Classes (WT vs KO,", day, ")"),
+    x = NULL, y = "Proportion"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title = element_text(hjust = 0.5, face = "bold"),
+        legend.title = element_text(size = 10),
+        legend.position = "right")
+
+  return(list(
+    de_results = de_results,
+    fc_plot = fc_plot,
+    volcano_plot = volcano_plot,
+      plot_up = plot_up,
+  plot_down = plot_down
+  ))
+}
+
+```
+
+
+
+```{r}
+gen_d0 <- run_de_genotype_comparison(data_log, coldata, day = "0 days", padj_threshold = 0.05)
+gen_d1 <- run_de_genotype_comparison(data_log, coldata, day = "1 day", padj_threshold = 0.05)
+gen_d3 <- run_de_genotype_comparison(data_log, coldata, day = "3 days", padj_threshold = 0.05)
+gen_d5 <- run_de_genotype_comparison(data_log, coldata, day = "5+ days", padj_threshold = 0.05)
+```
+
+## 💾 14. Save Genotype Comparison Outputs
+
+For each WT vs KO comparison at a given day, this section saves:
+
+- The DE table (`.csv`),
+- Fold-change and volcano plots (`.pdf`),
+- Class-specific barplots for significantly up- and downregulated lipids.
+
+This ensures complete capture of genotype-level analysis outputs in a structured directory for downstream usage.
+
+
+```{r}
+# Base path
+base_dir <- "/Users/cojulian/Desktop/Tzu_projects/Matt/Praise/lipidomics/comparisons_pergenotype_pre_may15"
+
+# Function to clean and format folder names (e.g., "0 days" -> "day_0")
+day_to_folder <- function(day) {
+  day_clean <- str_replace_all(tolower(day), "[^0-9]+", "")
+  paste0("day_", day_clean)
+}
+
+# Function to save outputs
+save_genotype_comparison <- function(result_obj, day_label, prefix = "WT_vs_KO", padj_threshold = 0.05) {
+  folder_name <- day_to_folder(day_label)
+  out_dir <- file.path(base_dir, folder_name)
+  dir_create(out_dir, recurse = TRUE)
+
+  # Clean file prefix
+  file_prefix <- paste0(prefix, "_", folder_name)
+
+  # File paths
+  csv_path     <- file.path(out_dir, paste0("DE_results_", file_prefix, ".csv"))
+  fc_plot_path <- file.path(out_dir, paste0("FoldChange_", file_prefix, ".pdf"))
+  vol_plot_path <- file.path(out_dir, paste0("Volcano_", file_prefix, ".pdf"))
+
+  # Save CSV and plots
+  write_csv(result_obj$de_results, csv_path)
+  ggsave(fc_plot_path, plot = result_obj$fc_plot, width = 8, height = 6, dpi = 300)
+  ggsave(vol_plot_path, plot = result_obj$volcano_plot, width = 8, height = 6, dpi = 300)
+
+    up_class_plot_path   <- file.path(out_dir, paste0("Barplot_Up_", file_prefix, ".pdf"))
+  down_class_plot_path <- file.path(out_dir, paste0("Barplot_Down_", file_prefix, ".pdf"))
+
+  ggsave(up_class_plot_path,   plot = result_obj$plot_up,   width = 6, height = 5, dpi = 300)
+  ggsave(down_class_plot_path, plot = result_obj$plot_down, width = 6, height = 5, dpi = 300)
+
+  
+  }
+
+# Save all genotype comparisons
+save_genotype_comparison(gen_d0, "0 days", padj_threshold = 0.05)
+save_genotype_comparison(gen_d1, "1 day", padj_threshold = 0.05)
+save_genotype_comparison(gen_d3, "3 days", padj_threshold = 0.05)
+save_genotype_comparison(gen_d5, "5+ days", padj_threshold = 0.05)
+```
+
+
+
+
